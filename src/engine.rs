@@ -1,111 +1,108 @@
 use crate::config::Config;
 use anyhow::Result;
 use std::io::Write;
+use std::num::NonZeroU32;
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel, Special, LlamaChatMessage};
 use llama_cpp_2::sampling::LlamaSampler;
 
-
-pub struct InferenceEngine {
-    backend: LlamaBackend,
-    model: LlamaModel,
+pub struct InferenceEngine<'a> {
+    model: &'a LlamaModel,
+    ctx: LlamaContext<'a>,
+    chat_history: Vec<LlamaChatMessage>,
 }
 
-impl InferenceEngine {
-    /// モデルをロードしてエンジンを初期化
-    pub fn new(config: &Config) -> Result<Self> {
-        let backend = LlamaBackend::init()?;
-        let model_params = LlamaModelParams::default();
-        let model =
-            LlamaModel::load_from_file(&backend, &config.model_path, &model_params)?;
-        Ok(Self { backend, model })
+impl<'a> InferenceEngine<'a> {
+    /// Initializes the inference engine with a model and backend.
+    pub fn new(model: &'a LlamaModel, backend: &LlamaBackend) -> Result<Self> {
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(2048)); // Increase context size for chat
+        let ctx = model.new_context(backend, ctx_params)?;
+
+        Ok(Self {
+            model,
+            ctx,
+            chat_history: Vec::new(),
+        })
     }
 
-    /// プロンプトから推論を実行し、結果をストリーミング出力
-    pub fn run(&mut self, config: &Config) -> Result<()> {
-        let ctx_params = LlamaContextParams::default();
+    /// Generates a response to a user input, maintaining conversation history.
+    pub fn chat(&mut self, user_input: &str, config: &Config) -> Result<()> {
+        self.chat_history.push(LlamaChatMessage::new("user".to_string(), user_input.to_string())?);
 
-        let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
-
-        // Try to apply chat template if available
         let prompt = match self.model.chat_template(None) {
             Ok(template) => {
-                let messages = vec![LlamaChatMessage::new("user".to_string(), config.prompt.clone())?];
-                match self.model.apply_chat_template(&template, &messages, true) {
+                match self.model.apply_chat_template(&template, &self.chat_history, true) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("Warning: Failed to apply chat template: {}", e);
-                        config.prompt.clone()
+                        user_input.to_string()
                     }
                 }
             },
-            Err(_) => config.prompt.clone(),
+            Err(_) => {
+                user_input.to_string()
+            }
         };
 
-        let tokens = self
-            .model
-            .str_to_token(&prompt, AddBos::Always)?;
+        let tokens = self.model.str_to_token(&prompt, AddBos::Always)?;
 
-        let mut batch = LlamaBatch::new(512, 1);
+        // This is inefficient. For a real application, we should manage the KV cache
+        // and only feed the new tokens. For this example, clearing is simpler.
+        self.ctx.clear_kv_cache();
+
+        let mut batch = LlamaBatch::new(2048, 1);
         let last_index: i32 = (tokens.len() - 1) as i32;
 
         for (i, token) in tokens.iter().enumerate() {
             batch.add(*token, i as i32, &[0], i as i32 == last_index)?;
         }
 
-        ctx.decode(&mut batch)?;
-
-        // Print the prompt only if we are using the raw prompt,
-        // or just print the user's input for context.
-        // Since the prompt variable might contain system tags, we stick to printing config.prompt
-        print!("{}", config.prompt);
-        std::io::stdout().flush()?;
+        self.ctx.decode(&mut batch)?;
 
         let mut generated_tokens = 0;
         let eos_token = self.model.token_eos();
+        let mut response_text = String::new();
 
-        // Create a sampler chain with penalties, temperature and top-p
         let mut sampler_chain = LlamaSampler::chain_simple([
-            // Penalize repetition to avoid loops and repetitive phrases
-            // last_n=64, repeat_penalty=1.1, freq_penalty=0.0, present_penalty=0.0
             LlamaSampler::penalties(64, 1.1, 0.0, 0.0),
-            LlamaSampler::temp(0.7), // Slightly lower temperature for more coherent output
+            LlamaSampler::temp(0.7),
             LlamaSampler::top_p(0.9, 1),
             LlamaSampler::dist(1234),
         ]);
 
-        // Inference loop with corrected sampling
         let mut n_curr = batch.n_tokens();
-        while generated_tokens < config.max_tokens {
-            // Use the sampler chain to sample the next token
-            let new_token = sampler_chain.sample(&mut ctx, batch.n_tokens() - 1);
 
-            // Accept the new token into the sampler chain to update internal state (e.g. for repetition penalty)
+        while generated_tokens < config.max_tokens {
+            // Pass &self.ctx (immutable reference) to sample
+            let new_token = sampler_chain.sample(&self.ctx, batch.n_tokens() - 1);
             sampler_chain.accept(new_token);
 
             if new_token == eos_token {
                 break;
             }
 
-            // The method is `token_to_string`, not `token_to_str`, and it is on the model
             let str_slice = self.model.token_to_str(new_token, Special::Tokenize)?;
-
             print!("{}", str_slice);
             std::io::stdout().flush()?;
+            response_text.push_str(&str_slice);
 
             batch.clear();
             batch.add(new_token, n_curr, &[0], true)?;
             
             n_curr += 1;
-            ctx.decode(&mut batch)?;
+            self.ctx.decode(&mut batch)?;
             generated_tokens += 1;
         }
 
         println!();
+
+        self.chat_history.push(LlamaChatMessage::new("assistant".to_string(), response_text)?);
+
         Ok(())
     }
 }

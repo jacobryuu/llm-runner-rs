@@ -7,11 +7,11 @@ pub struct Config {
     #[arg(short, long)]
     pub model_path: String,
 
-    /// The prompt to start generation with
+    /// An initial prompt to start the conversation with (optional)
     #[arg(long)]
-    pub prompt: String,
+    pub prompt: Option<String>,
 
-    /// Number of tokens to generate
+    /// Number of tokens to generate per turn
     #[arg(long, default_value_t = 256)]
     pub max_tokens: usize,
 
