@@ -18,4 +18,8 @@ pub struct Config {
     /// Number of GPU layers to offload
     #[arg(long, default_value_t = 0)]
     pub n_gpu_layers: i32,
+
+    /// Run in server mode (API server)
+    #[arg(long, default_value_t = false)]
+    pub server_mode: bool,
 }
